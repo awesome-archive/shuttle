@@ -2,3 +2,5 @@
 .conf/
 temp/
 _output/
+scripts/
+assets/assets.go

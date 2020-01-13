@@ -1,12 +1,20 @@
 package shuttle
 
 import (
+	"bufio"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
-	"bufio"
 	"strings"
 	"time"
+
+	"context"
+	"github.com/sipt/shuttle/config"
+	connect "github.com/sipt/shuttle/conn"
+	"github.com/sipt/shuttle/log"
+	"github.com/sipt/shuttle/proxy"
+	rule2 "github.com/sipt/shuttle/rule"
 	"github.com/sipt/shuttle/util"
 )
 
@@ -33,187 +41,174 @@ func GetAllowDump() bool {
 	return allowDump
 }
 
+// init MitMRules
 func SetMitMRules(rs []string) {
 	MitMRules = rs
 }
-func GetMitMRules() []string {
+func GetMitMRules() []string { // For controller API
 	return MitMRules
 }
-
-func HandleHTTP(co net.Conn) {
-	Logger.Debug("start shuttle.IConn wrap net.Con")
-	conn, err := NewDefaultConn(co, TCP)
-	if err != nil {
-		Logger.Errorf("shuttle.IConn wrap net.Conn failed: %v", err)
-		return
-	}
-	Logger.Debugf("shuttle.IConn wrap net.Con success [ID:%d]", conn.GetID())
-	Logger.Debugf("[ID:%d] start read http request", conn.GetID())
-	//prepare request
-	req, hreq, err := prepareRequest(conn)
-	if err != nil {
-		Logger.Error("prepareRequest failed: ", err)
-		return
-	}
-
-	//request modify Or mock ?
-	respBuf, err := RequestModifyOrMock(req, hreq, hreq.URL.Scheme == HTTP)
-	if err != nil {
-		Logger.Errorf("[ID:%d] request modify or mock failed: %v", conn.GetID(), err)
-	}
-	if len(respBuf) > 0 {
-		conn.Write(respBuf)
-		return
-	}
-
-	//inner controller domain
-	if req.Addr == ControllerDomain {
-		port, err := strconv.ParseUint(controllerPort, 10, 16)
-		if err == nil {
-			req.IP = []byte{127, 0, 0, 1}
-			req.Port = uint16(port)
-		}
-	}
-
-	//filter by Rules and DNS
-	rule, s, err := FilterByReq(req)
-	if err != nil {
-		Logger.Error("ConnectToServer failed [", req.Host(), "] err: ", err)
-	}
-
-	//connect to server
-	sc, err := s.Conn(req)
-	if err != nil {
-		if err == ErrorReject {
-			Logger.Debugf("Reject [%s]", req.Target)
-			recordChan <- &Record{
-				ID:       util.NextID(),
-				Protocol: req.Protocol,
-				Created:  time.Now(),
-				Proxy:    s,
-				Status:   RecordStatusReject,
-				URL:      req.Target,
-				Rule:     rule,
-			}
-		} else {
-			Logger.Error("ConnectToServer failed [", req.Host(), "] err: ", err)
-		}
-		return
-	}
-	Logger.Debugf("Bind [client-local](%d) [local-server](%d)", conn.GetID(), sc.GetID())
-	if req.Protocol == ProtocolHttps {
-		_, err = conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
-		if err != nil {
-			Logger.Error("reply https-CONNECT failed: ", err)
-			conn.Close()
-			sc.Close()
+func AppendMitMRules(r string) { // For controller API
+	MitMRules = append(MitMRules, r)
+	conf := config.CurrentConfig()
+	conf.Mitm.Rules = MitMRules
+	config.SaveConfig(config.CurrentConfigFile(), conf)
+}
+func RemoveMitMRules(r string) { // For controller API
+	for i, v := range MitMRules {
+		if v == r {
+			MitMRules[i] = MitMRules[len(MitMRules)-1]
+			MitMRules = MitMRules[:len(MitMRules)-1]
+			conf := config.CurrentConfig()
+			conf.Mitm.Rules = MitMRules
+			config.SaveConfig(config.CurrentConfigFile(), conf)
 			return
 		}
 	}
-	//todo 白名单判断
-	if req.Addr == ControllerDomain {
-		lc, err := TimerDecorate(conn, defaultTimeOut, -1)
-		if err != nil {
-			Logger.Error("Timer Decorate net.Conn failed: ", err)
-			lc = conn
-		}
-		hreq.Write(sc)
-		direct := &DirectChannel{}
-		direct.Transport(lc, sc)
-		return
-	}
-	//MitM filter
-	mitm := false
-	if allowMitm && len(MitMRules) > 0 && req.Protocol == ProtocolHttps {
-		for _, v := range MitMRules {
-			if v == "*" { // 通配
-				Logger.Debugf("[ID:%d] [HTTP/HTTPS] MitM filter [%s] use [%s]", conn.GetID(), req.Addr, v)
-				mitm = true
-				break
-			} else if v == req.Addr { // 全区配
-				Logger.Debugf("[ID:%d] [HTTP/HTTPS] MitM filter [%s] use [%s]", conn.GetID(), req.Addr, v)
-				mitm = true
-				break
-			} else if v[0] == '*' && strings.HasSuffix(req.Addr, v[1:]) { // 后缀匹配
-				Logger.Debugf("[ID:%d] [HTTP/HTTPS] MitM filter [%s] use [%s]", conn.GetID(), req.Addr, v)
-				mitm = true
-				break
-			}
-		}
-		//MitM Decorate
-		if mitm {
-			Logger.Debugf("[ID:%d] [HTTP/HTTPS] MitM Decorate", conn.GetID())
-			lct, sct, err := Mimt(conn, sc, req)
-			if err != nil {
-				Logger.Error("[HTTPS] MitM failed: ", err)
-				conn.Close()
-				sc.Close()
-				return
-			}
-			conn, sc = lct, sct
-		}
-	}
-
-	record := &Record{
-		ID:       sc.GetID(),
-		Protocol: req.Protocol,
-		Created:  time.Now(),
-		Proxy:    s,
-		Status:   RecordStatusActive,
-		URL:      req.Target,
-		Rule:     rule,
-	}
-	lc, err := TimerDecorate(conn, defaultTimeOut, -1)
-	if err != nil {
-		Logger.Error("Timer Decorate net.Conn failed: ", err)
-		lc = conn
-	}
-	//Dump Decorate
-	if mitm {
-		HttpTransport(lc, sc, record, allowDump, nil)
-		return
-	} else if req.Protocol == ProtocolHttp {
-		HttpTransport(lc, sc, record, allowDump, hreq)
-		return
-	} else {
-		recordChan <- record
-	}
-
-	direct := &DirectChannel{}
-	direct.Transport(lc, sc)
 }
 
-func prepareRequest(conn IConn) (*Request, *http.Request, error) {
+func HandleHTTP(co net.Conn) {
+	log.Logger.Debug("start conn.IConn wrap net.Con")
+	conn, err := connect.NewDefaultConn(co, connect.TCP)
+	if err != nil {
+		log.Logger.Errorf("[HTTP] shuttle.IConn wrap net.Conn failed: %v", err)
+		return
+	}
+	log.Logger.Debugf("[HTTP] [ID:%d] shuttle.IConn wrap net.Conn success", conn.GetID())
+	log.Logger.Debugf("[HTTP] [ID:%d] start read http request", conn.GetID())
+	//prepare request
+	hreq, err := prepareRequest(conn)
+	if err != nil {
+		if err != io.EOF {
+			log.Logger.Errorf("[HTTP] [ID:%d] prepareRequest failed: %s", conn.GetID(), err.Error())
+		}
+		return
+	}
+
+	//switch hreq.Proto {
+	//case "HTTP/2":
+	//	ProxyHTTP2()
+	//case "HTTP/1.1":
+	if hreq.URL.Scheme == HTTP { // HTTP
+		ProxyHTTP(conn, hreq)
+	} else { // HTTPS
+		ProxyHTTPS(conn, hreq)
+	}
+	//}
+}
+
+func ProxyHTTP(lc connect.IConn, hreq *http.Request) {
+	HttpTransport(lc, nil, allowDump, hreq)
+}
+func ProxyHTTPS(lc connect.IConn, hreq *http.Request) {
+	// Handshake
+	_, err := lc.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+	if err != nil {
+		log.Logger.Errorf("[HTTPS] [ID:%d] reply https-CONNECT failed: %s", lc.GetID(), err.Error())
+		lc.Close()
+		return
+	}
+	domain := hreq.URL.Hostname()
+	rule, server, sc, err := ConnectFilter(hreq, lc.GetID())
+	record := &Record{
+		Protocol: HTTPS,
+		Created:  time.Now(),
+		Status:   RecordStatusActive,
+		URL:      hreq.URL.String(),
+		Proxy:    server,
+		Rule:     rule,
+	}
+	if hreq.URL.Scheme == "" {
+		record.URL = "https:" + record.URL
+	}
+	if err != nil {
+		if err == ErrorReject {
+			record.Status = RecordStatusReject
+		} else {
+			record.Status = RecordStatusFailed
+			record.Rule = rule2.FailedRule
+			record.Proxy = proxy.FailedServer
+		}
+		record.ID = util.NextID()
+		boxChan <- &Box{Op: RecordAppend, Value: record}
+		return
+	}
+	// MitM
+	mitm := false
+	if allowMitm {
+		for _, v := range MitMRules {
+			if v == "*" { // 通配
+				log.Logger.Debugf("[HTTPS] [ID:%d] MitM RuleFilter [%s] use [%s]", lc.GetID(), domain, v)
+				mitm = true
+				break
+			} else if v == domain { // 全区配
+				log.Logger.Debugf("[HTTPS] [ID:%d] MitM RuleFilter [%s] use [%s]", lc.GetID(), domain, v)
+				mitm = true
+				break
+			} else if v[0] == '*' && strings.HasSuffix(domain, v[1:]) { // 后缀匹配
+				log.Logger.Debugf("[HTTPS] [ID:%d] MitM RuleFilter [%s] use [%s]", lc.GetID(), domain, v)
+				mitm = true
+				break
+			}
+		}
+	}
+	//MitM Decorate
+	if mitm {
+		log.Logger.Debugf("[HTTPS] [ID:%d] MitM Decorate", lc.GetID())
+		lct, sct, err := Mimt(lc, sc)
+		if err != nil {
+			log.Logger.Error("[HTTPS] [ID:%d] MitM failed: %s", lc.GetID(), err.Error())
+			record.Status = RecordStatusFailed
+			boxChan <- &Box{Op: RecordAppend, Value: record}
+			lc.Close()
+			sc.Close()
+			return
+		}
+		lc, sc = lct, sct
+		ctx := sc.Context()
+		ctx = context.WithValue(ctx, "rule", rule)
+		ctx = context.WithValue(ctx, "server", server)
+		sc.SetContext(ctx)
+		HttpTransport(lc, sc, allowDump, nil)
+		return
+	}
+
+	record.ID = util.NextID()
+	boxChan <- &Box{Op: RecordAppend, Value: record}
+	sc.SetRecordID(record.ID)
+	direct := &DirectChannel{}
+	direct.Transport(lc, sc)
+	boxChan <- &Box{record.ID, RecordStatus, RecordStatusCompleted}
+}
+
+func ProxyHTTP2() {
+
+}
+
+func prepareRequest(conn connect.IConn) (*http.Request, error) {
 	br := bufio.NewReader(conn)
 	hreq, err := http.ReadRequest(br)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	Logger.Debugf("[ID:%d] [HTTP/HTTPS] %s:%s", conn.GetID(), hreq.URL.Hostname(), hreq.URL.Port())
-	req := &Request{
-		Ver:    socksVer5,
-		Cmd:    CmdTCP,
-		Atyp:   AddrTypeDomain,
-		ConnID: conn.GetID(),
-	}
-	if hreq.URL.Scheme == HTTP {
-		req.Protocol = ProtocolHttp
-		if req.Port == 0 {
-			req.Port = 80
-		}
-	} else if hreq.Method == http.MethodConnect {
-		req.Protocol = ProtocolHttps
-		if req.Port == 0 {
-			req.Port = 443
-		}
-	}
-	return req, hreq, nil
+	log.Logger.Debugf("[ID:%d] [HTTP/HTTPS] %s:%s", conn.GetID(), hreq.URL.Hostname(), hreq.URL.Port())
+	return hreq, nil
 }
 
-func strToUint16(v string) (i uint16, err error) {
+func StrToUint16(v string) (i uint16, err error) {
 	r, err := strconv.ParseUint(v, 10, 2*8)
 	if err == nil {
 		i = uint16(r)
 	}
 	return
+}
+
+func IsPass(host, port, ip string) bool {
+	if host == ControllerDomain {
+		return true
+	}
+	if (host == "localhost" || host == "127.0.0.1" || ip == "127.0.0.1") && ControllerPort == port {
+		return true
+	}
+	return false
 }

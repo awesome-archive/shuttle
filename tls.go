@@ -1,28 +1,35 @@
 package shuttle
 
 import (
-	"crypto/x509"
-	"crypto/rsa"
-	"encoding/base64"
-	"crypto/rand"
-	"crypto/x509/pkix"
-	"math/big"
-	"time"
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
-	"crypto/tls"
-	"os"
-	"reflect"
-	"unsafe"
 	"fmt"
+	"github.com/sipt/shuttle/config"
+	connect "github.com/sipt/shuttle/conn"
+	"math/big"
+	"reflect"
+	"time"
+	"unsafe"
 )
 
 var ca *x509.Certificate
 var caBytes []byte
 var key *rsa.PrivateKey
 
-func InitCert(mitm *Mitm) error {
+type IMITMConfig interface {
+	GetMITM() *config.Mitm
+	SetMITM(*config.Mitm)
+}
+
+func ApplyMITMConfig(config IMITMConfig) error {
+	mitm := config.GetMITM()
 	if mitm == nil {
 		return nil
 	}
@@ -35,6 +42,8 @@ func InitCert(mitm *Mitm) error {
 		return err
 	}
 	ca, key, err = LoadCA(caBytes, keyBytes)
+
+	MitMRules = mitm.Rules
 	return err
 }
 func GetCACert() []byte {
@@ -47,11 +56,10 @@ func GetCACert() []byte {
 	return bak
 }
 
-func GenerateCA() error {
-	var err error
+func GenerateCA() (mitm *config.Mitm, err error) {
 	key, err = rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return err
+		return
 	}
 	names := pkix.Name{
 		Organization: []string{"Shuttle"},
@@ -68,41 +76,45 @@ func GenerateCA() error {
 		},
 	}
 	template := &x509.Certificate{
-		Version:      1,
-		SerialNumber: big.NewInt(1),
-		Subject:      names,
-		Issuer:       names,
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().AddDate(5, 0, 0),
-		KeyUsage:     0,
+		Version:               1,
+		SerialNumber:          big.NewInt(1),
+		Subject:               names,
+		Issuer:                names,
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().AddDate(5, 0, 0),
+		BasicConstraintsValid: true,
+		IsCA:        true,
+		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 	}
 
 	caBytes, err = x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
-		return err
+		return
 	}
 	ca, err = x509.ParseCertificate(caBytes)
 	if err != nil {
-		return err
+		return
 	}
 
 	// Generate cert
 	certBuffer := bytes.Buffer{}
-	if err := pem.Encode(&certBuffer, &pem.Block{Type: "CERTIFICATE", Bytes: caBytes}); err != nil {
-		return err
+	if err = pem.Encode(&certBuffer, &pem.Block{Type: "CERTIFICATE", Bytes: caBytes}); err != nil {
+		return
 	}
 
 	// Generate key
 	keyBuffer := bytes.Buffer{}
-	if err := pem.Encode(&keyBuffer, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}); err != nil {
-		return err
+	if err = pem.Encode(&keyBuffer, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}); err != nil {
+		return
 	}
-	//Save privateKey and CA to config file
-	SetMimt(&Mitm{
-		CA:  base64.RawStdEncoding.EncodeToString(certBuffer.Bytes()),
-		Key: base64.RawStdEncoding.EncodeToString(keyBuffer.Bytes()),
-	})
-	return nil
+
+	mitm = &config.Mitm{
+		CA:    base64.RawStdEncoding.EncodeToString(certBuffer.Bytes()),
+		Key:   base64.RawStdEncoding.EncodeToString(keyBuffer.Bytes()),
+		Rules: MitMRules,
+	}
+	return
 }
 
 func LoadCA(caPem, keyPem []byte) (*x509.Certificate, *rsa.PrivateKey, error) {
@@ -131,14 +143,13 @@ func makeCert(cert *x509.Certificate) ([]byte, error) {
 	return derBytes, nil
 }
 
-func Mimt(lc, sc IConn, req *Request) (IConn, IConn, error) {
+func Mimt(lc, sc connect.IConn) (connect.IConn, connect.IConn, error) {
 	if ca == nil {
 		return nil, nil, errors.New("please first generate CA")
 	}
 	conf := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: true,
-		KeyLogWriter:       os.Stdout,
 	}
 	lcID, scID := lc.GetID(), sc.GetID()
 	scTls := tls.Client(sc, conf)
@@ -154,7 +165,7 @@ func Mimt(lc, sc IConn, req *Request) (IConn, IConn, error) {
 		ptr := (uintptr)(unsafe.Pointer(scTls))
 		cert = (*(*[]*x509.Certificate)(unsafe.Pointer(ptr + filed.Offset)))[0]
 	}
-	sc, err = DefaultDecorateForTls(scTls, req.Network(), scID)
+	sc, err = connect.DefaultDecorateForTls(scTls, connect.TCP, scID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -165,7 +176,6 @@ func Mimt(lc, sc IConn, req *Request) (IConn, IConn, error) {
 	conf = &tls.Config{
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: true,
-		KeyLogWriter:       os.Stdout,
 		Certificates: []tls.Certificate{
 			{
 				Certificate: [][]byte{derCert},
@@ -174,6 +184,6 @@ func Mimt(lc, sc IConn, req *Request) (IConn, IConn, error) {
 		},
 	}
 	lcTls := tls.Server(lc, conf)
-	lc, err = DefaultDecorateForTls(lcTls, req.Network(), lcID)
+	lc, err = connect.DefaultDecorateForTls(lcTls, connect.TCP, lcID)
 	return lc, sc, err
 }

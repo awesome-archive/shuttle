@@ -1,8 +1,11 @@
 package api
 
-import "github.com/gin-gonic/gin"
+import (
+	"github.com/gin-gonic/gin"
+	. "github.com/sipt/shuttle/constant"
+)
 
-func APIRoute(router *gin.RouterGroup, shutdownSingnal chan bool, reloadConfigSignal chan bool) {
+func APIRoute(router *gin.RouterGroup, eventChan chan *EventObj) {
 	//dns
 	router.GET("/dns", DNSCacheList)
 	router.DELETE("/dns", ClearDNSCache)
@@ -17,6 +20,7 @@ func APIRoute(router *gin.RouterGroup, shutdownSingnal chan bool, reloadConfigSi
 		dump.POST("/allow", SetAllowDump)
 		dump.GET("/allow", GetAllowDump)
 		dump.GET("/data/:conn_id", DumpRequest)
+		dump.GET("/large/:conn_id", DumpLarge)
 	}
 
 	//cert
@@ -29,10 +33,22 @@ func APIRoute(router *gin.RouterGroup, shutdownSingnal chan bool, reloadConfigSi
 	router.POST("/server/select/refresh", SelectRefresh)
 
 	//general
-	router.POST("/shutdown", NewShutdown(shutdownSingnal))
-	router.POST("/reload", ReloadConfig(reloadConfigSignal))
+	router.GET("/system/proxy/enable", EnableSystemProxy)
+	router.GET("/system/proxy/disable", DisableSystemProxy)
+	router.POST("/shutdown", NewShutdown(eventChan))
+	router.POST("/reload", ReloadConfig(eventChan))
 	router.GET("/mode", GetConnMode)
 	router.POST("/mode/:mode", SetConnMode)
+	router.GET("/upgrade/check", CheckUpdate)
+	router.POST("/upgrade", NewUpgrade(eventChan))
+
+	//ws
+	router.GET("/ws/records", func(ctx *gin.Context) {
+		WsHandler(ctx.Writer, ctx.Request)
+	})
+	router.GET("/ws/speed", func(ctx *gin.Context) {
+		WsSpeedHandler(ctx.Writer, ctx.Request)
+	}) // 时速
 }
 
 type Response struct {
